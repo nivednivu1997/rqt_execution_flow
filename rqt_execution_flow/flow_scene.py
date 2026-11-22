@@ -14,6 +14,7 @@ from python_qt_binding.QtWidgets import (QGraphicsItem, QGraphicsPathItem,
                                          QGraphicsScene, QGraphicsSimpleTextItem,
                                          QGraphicsView)
 
+from .schedule import PacketScheduler
 from .tracker import ACTION
 
 ACTION_COLOR = QColor('#2563eb')
@@ -36,6 +37,20 @@ PACKETS = {
 }
 FLASH = {'result_ok': '#16a34a', 'result_canceled': '#d97706',
          'result_failed': '#dc2626', 'response': '#c026d3'}
+# Node roles: blues for actions, purples/rose for services; servers are the darker shade.
+ROLE_ORDER = ('action_server', 'action_client', 'service_server', 'service_client')
+ROLE_COLORS = {
+    'action_server': '#1e40af',
+    'action_client': '#0e7490',
+    'service_server': '#6b21a8',
+    'service_client': '#be185d',
+}
+ROLE_LABELS = {   # (full, short) - short is used when the full tags don't fit
+    'action_server': ('action server', 'A-srv'),
+    'action_client': ('action client', 'A-cli'),
+    'service_server': ('service server', 'S-srv'),
+    'service_client': ('service client', 'S-cli'),
+}
 TRAVEL_TIME = 0.9
 FEEDBACK_TRAVEL_TIME = 0.75
 
@@ -51,7 +66,7 @@ class NodeItem(QGraphicsItem):
         self.edges = []
         self.busy = False
         self.pinned = False
-        self.roles = ''
+        self.roles = {}     # role -> count, or a short note for pseudo nodes
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable
                       | QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(3)
@@ -70,28 +85,80 @@ class NodeItem(QGraphicsItem):
             p.setPen(Qt.NoPen)
             p.setBrush(glow)
             p.drawRoundedRect(rect.adjusted(-4, -4, 4, 4), 11, 11)
-        border = TEXT_COLOR if self.isSelected() else (ACTION_COLOR if self.busy else IDLE_COLOR)
-        p.setPen(QPen(border, 2.2 if (self.busy or self.isSelected()) else 1.2))
+        p.setPen(Qt.NoPen)
         p.setBrush(QColor('#eff6ff') if self.busy else QColor('#ffffff'))
         p.drawRoundedRect(rect, 8, 8)
 
+        # role stripe on the left edge, one band per role
+        roles = [r for r in ROLE_ORDER if isinstance(self.roles, dict) and self.roles.get(r)]
+        if roles:
+            clip = QPainterPath()
+            clip.addRoundedRect(rect, 8, 8)
+            p.save()
+            p.setClipPath(clip)
+            band = NODE_H / len(roles)
+            for i, role in enumerate(roles):
+                p.fillRect(QRectF(rect.left(), rect.top() + i * band, 7, band + 0.5),
+                           QColor(ROLE_COLORS[role]))
+            p.restore()
+
+        border = TEXT_COLOR if self.isSelected() else (ACTION_COLOR if self.busy else IDLE_COLOR)
+        p.setPen(QPen(border, 2.2 if (self.busy or self.isSelected()) else 1.2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect, 8, 8)
+
+        left = 15 if roles else 10
         title = QFont()
         title.setBold(True)
         title.setPointSizeF(9.5)
         p.setFont(title)
         p.setPen(TEXT_COLOR)
-        text_rect = rect.adjusted(10, 5, -10, -NODE_H / 2)
+        text_rect = rect.adjusted(left, 5, -10, -NODE_H / 2)
         name = QFontMetrics(title).elidedText(self.name, Qt.ElideLeft, int(text_rect.width()))
         p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, name)
 
-        small = QFont()
-        small.setPointSizeF(8)
-        p.setFont(small)
-        p.setPen(ACTION_COLOR if self.busy else MUTED_TEXT)
-        sub_rect = rect.adjusted(10, NODE_H / 2, -10, -5)
-        sub = ('working  ·  ' if self.busy else '') + self.roles
-        p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter,
-                   QFontMetrics(small).elidedText(sub, Qt.ElideRight, int(sub_rect.width())))
+        sub_rect = rect.adjusted(left, NODE_H / 2, -8, -5)
+        if roles:
+            self._paint_role_tags(p, roles, sub_rect)
+        elif self.roles:
+            small = QFont()
+            small.setPointSizeF(8)
+            p.setFont(small)
+            p.setPen(MUTED_TEXT)
+            p.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter, str(self.roles))
+
+    def _paint_role_tags(self, p, roles, area):
+        """Small coloured tags such as 'action server', 'service client x2'."""
+        tag_font = QFont()
+        tag_font.setPointSizeF(7.2)
+        tag_font.setBold(True)
+        fm = QFontMetrics(tag_font)
+
+        def texts(short):
+            out = []
+            for r in roles:
+                label = ROLE_LABELS[r][1 if short else 0]
+                count = self.roles[r]
+                out.append(label + (f' \u00D7{count}' if count > 1 else ''))
+            return out
+
+        labels = texts(short=False)
+        if sum(fm.horizontalAdvance(t) + 12 for t in labels) > area.width():
+            labels = texts(short=True)
+        p.setFont(tag_font)
+        x = area.left()
+        h = 14.0
+        y = area.center().y() - h / 2
+        for role, text in zip(roles, labels):
+            w = fm.horizontalAdvance(text) + 8
+            if x + w > area.right():
+                break
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(ROLE_COLORS[role]))
+            p.drawRoundedRect(QRectF(x, y, w, h), 4, 4)
+            p.setPen(QColor('#ffffff'))
+            p.drawText(QRectF(x, y, w, h), Qt.AlignCenter, text)
+            x += w + 4
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
@@ -274,7 +341,7 @@ class EdgeItem(QGraphicsPathItem):
 
 class PacketItem(QGraphicsItem):
 
-    def __init__(self, edge, ptype, delay):
+    def __init__(self, edge, ptype, delay, duration):
         super().__init__()
         self.edge = edge
         self.ptype = ptype
@@ -282,7 +349,7 @@ class PacketItem(QGraphicsItem):
         self.color = QColor(color)
         self.wait = delay
         self.t = 0.0
-        self.duration = FEEDBACK_TRAVEL_TIME if ptype == 'feedback' else TRAVEL_TIME
+        self.duration = duration
         self.setZValue(6)
         self.setVisible(False)
 
@@ -344,6 +411,8 @@ class FlowScene(QGraphicsScene):
         self.edges = {}
         self.packets = []
         self.isolated = set()
+        self.clock = 0.0                      # animation time, advanced by tick()
+        self.scheduler = PacketScheduler()    # keeps cause and effect in the animation
         tile = QPixmap(28, 28)
         tile.fill(QColor('#f8fafc'))
         painter = QPainter(tile)
@@ -482,15 +551,25 @@ class FlowScene(QGraphicsScene):
             return
         if ptype == 'feedback' and sum(1 for p in self.packets if p.edge is edge) > 40:
             return   # keep the scene responsive with very fast feedback
-        pk = PacketItem(edge, ptype, delay)
+        forward = PACKETS[ptype][1] > 0
+        depart, arrive = (edge.src, edge.dst) if forward else (edge.dst, edge.src)
+        feedback = ptype == 'feedback'
+        wait, travel = self.scheduler.schedule(
+            self.clock, delay, depart.name, arrive.name,
+            FEEDBACK_TRAVEL_TIME if feedback else TRAVEL_TIME, sets_ready=not feedback)
+        pk = PacketItem(edge, ptype, wait, travel)
         self.addItem(pk)
         self.packets.append(pk)
         if ptype in FLASH:
-            edge.pending_flash = (FLASH[ptype], delay + pk.duration)
+            edge.pending_flash = (FLASH[ptype], wait + travel)
 
     def set_activity(self, counts, busy_nodes):
+        # The animation can run a little behind real time (see schedule.py).
+        # Keep a link busy, and its server working, until its packets have landed.
+        in_flight = {pk.edge.key for pk in self.packets if pk.ptype != 'feedback'}
+        busy_nodes = set(busy_nodes) | {key[3] for key in in_flight}
         for key, edge in self.edges.items():
-            c = counts.get(key, 0)
+            c = counts.get(key, 0) or (1 if key in in_flight else 0)
             if c:
                 edge.ever_active = True
             if c != edge.active_count:
@@ -511,6 +590,7 @@ class FlowScene(QGraphicsScene):
                 e.update()
 
     def tick(self, dt):
+        self.clock += dt
         alive = []
         for pk in self.packets:
             if pk.advance_by(dt):
@@ -549,6 +629,7 @@ class FlowScene(QGraphicsScene):
         for pk in self.packets:
             self.removeItem(pk)
         self.packets = []
+        self.scheduler.clear()
 
 
 class FlowView(QGraphicsView):
