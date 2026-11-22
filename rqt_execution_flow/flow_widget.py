@@ -17,7 +17,7 @@ from python_qt_binding.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox
                                          QSlider, QSplitter, QTextBrowser, QTreeWidget,
                                          QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .flow_scene import PACKETS, FlowScene, FlowView
+from .flow_scene import PACKETS, ROLE_COLORS, ROLE_LABELS, ROLE_ORDER, FlowScene, FlowView
 from .monitor import RosMonitor
 from .recorder import Player, Recording
 from .tracker import ACTION, GOAL_STATUS, UNKNOWN_NODE, Tracker
@@ -226,7 +226,14 @@ class ExecutionFlowWidget(QWidget):
         self._left_split.setSizes([600, 340])
 
         self._right_split = QSplitter(Qt.Vertical)
-        self._right_split.addWidget(self._titled('Flow', self._view))
+        flow_box = self._titled('Flow', self._view)
+        key = '&nbsp;&nbsp;'.join(
+            f'<span style="background:{ROLE_COLORS[r]}; color:white;">&nbsp;'
+            f'{ROLE_LABELS[r][0]}&nbsp;</span>' for r in ROLE_ORDER)
+        flow_box.title_label.setText(
+            f'<b>Flow</b>&nbsp;&nbsp;&nbsp;<span style="color:#64748b">Node roles:</span>'
+            f'&nbsp;&nbsp;{key}')
+        self._right_split.addWidget(flow_box)
         self._right_split.addWidget(self._titled('Event timeline', self._log))
         self._right_split.setSizes([600, 340])
 
@@ -395,15 +402,15 @@ class ExecutionFlowWidget(QWidget):
         g = self._tracker.graph
         specs, isolated, roles = {}, set(), {}
 
-        def add_role(node, text):
-            roles.setdefault(node, []).append(text)
+        def add_role(node, role):
+            roles.setdefault(node, Counter())[role] += 1
 
         for kind, servers, clients in ((ACTION, g.action_servers, g.action_clients),
                                        ('service', g.service_servers, g.service_clients)):
             for name, srv_nodes in servers.items():
                 introspected = kind == ACTION or name in g.introspected
                 for s in srv_nodes:
-                    add_role(s, 'serves')
+                    add_role(s, f'{kind}_server')
                     callers = [c for c in clients.get(name, ()) if c != s]
                     if not callers:
                         isolated.add(s)
@@ -411,7 +418,7 @@ class ExecutionFlowWidget(QWidget):
                         specs[(kind, name, c, s)] = introspected
             for name, cl_nodes in clients.items():
                 for c in cl_nodes:
-                    add_role(c, 'calls')
+                    add_role(c, f'{kind}_client')
         for key in self._seen_edges:
             specs.setdefault(key, True)
 
@@ -425,17 +432,9 @@ class ExecutionFlowWidget(QWidget):
             isolated = {n for n in isolated if text in n.lower()}
         isolated -= {k[2] for k in specs} | {k[3] for k in specs}
 
-        role_text = {}
-        for node, parts in roles.items():
-            c = Counter(parts)
-            bits = []
-            if c['serves']:
-                bits.append(f'serves {c["serves"]}')
-            if c['calls']:
-                bits.append(f'calls {c["calls"]}')
-            role_text[node] = ', '.join(bits)
-        role_text[UNKNOWN_NODE] = 'caller not in graph'
-        if self._scene.sync(specs, isolated, role_text):
+        roles = {node: dict(c) for node, c in roles.items()}
+        roles[UNKNOWN_NODE] = 'caller not in graph'
+        if self._scene.sync(specs, isolated, roles):
             self._view.auto_fit()
 
     def _relayout(self):

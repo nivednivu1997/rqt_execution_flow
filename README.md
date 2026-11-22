@@ -32,6 +32,13 @@ canceled.
 
 It is **read-only**. It never sends goals, cancels goals or calls services.
 
+> [!IMPORTANT]
+> **Actions work out of the box. Service calls need one step from you.**
+> ROS 2 Jazzy only reports a service call if the node that serves or makes it has
+> turned on **service introspection**. Until you add that one line to your node,
+> its service calls won't appear in the plugin. See
+> [Making service calls visible](#making-service-calls-visible).
+
 ## Features
 
 - **Live call tree.** Action goals and service calls, nested under the call that
@@ -118,6 +125,17 @@ Packet legend:
 | Purple dot | Service request | caller → server |
 | Magenta square | Service response | server → caller |
 
+Node colours: each node has a coloured stripe on its left edge and a tag for every
+role it plays. A node with several roles gets one stripe band and one tag per role.
+When the tags don't fit, they switch to short forms such as `A-srv` and `S-cli`.
+
+| Colour | Role |
+|---|---|
+| Dark blue | Action server |
+| Teal | Action client |
+| Purple | Service server |
+| Rose | Service client |
+
 Toolbar options: **Filter** by name, **Only links with traffic**, **Hide finished**,
 **Log every feedback**, **Fit view**, **Re-layout**, **Pause** and **Clear**.
 
@@ -147,14 +165,29 @@ if `ROS_HOME` is set. Old recordings are never deleted for you.
 
 What the plugin can see on Jazzy:
 
-| Traffic | Needs code changes? |
+| Traffic | Needs a change in your nodes? |
 |---|---|
 | Action goal status: accepted, executing, canceling, succeeded, canceled, aborted | No |
 | Action feedback, with its content | No |
-| Service calls | Yes, one line per node |
+| **Service calls** | **Yes: turn on service introspection, one line per node** |
 
-Jazzy only publishes service calls when the node turns on **service
-introspection**. In Python, call this after creating your clients and services:
+ROS 2 Jazzy only reports a service call when the node turns on **service
+introspection**. It is off by default, and Jazzy has no parameter or environment
+variable to turn it on. It has to be done in code.
+
+### If you skip this step
+
+- The node's service calls **never appear** in the call tree, flow view or timeline.
+- The service's link is drawn **dotted** and labelled `(introspection off)`.
+- A warning at the top says how many services can't be seen. Hover over it for
+  the list.
+
+Actions are not affected. They show up either way.
+
+### Python nodes
+
+With this package installed, call the helper once, **after** creating your clients
+and services. It turns introspection on for all of them:
 
 ```python
 from rqt_execution_flow.introspection import enable_service_introspection
@@ -162,15 +195,57 @@ from rqt_execution_flow.introspection import enable_service_introspection
 enable_service_introspection(node)
 ```
 
-In C++, for each client or service:
+Without depending on this package, use plain rclpy on each client or service:
+
+```python
+from rclpy.qos import qos_profile_system_default
+from rclpy.service_introspection import ServiceIntrospectionState
+
+my_service.configure_introspection(
+    node.get_clock(), qos_profile_system_default, ServiceIntrospectionState.CONTENTS)
+```
+
+### C++ nodes
+
+Call this on each service and each client, after creating it:
 
 ```cpp
-client->configure_introspection(
-    node->get_clock(), rclcpp::SystemDefaultsQoS(),
+#include "rcl/service_introspection.h"
+
+my_service->configure_introspection(
+    get_clock(), rclcpp::SystemDefaultsQoS(),
+    RCL_SERVICE_INTROSPECTION_CONTENTS);
+
+my_client->configure_introspection(
+    get_clock(), rclcpp::SystemDefaultsQoS(),
     RCL_SERVICE_INTROSPECTION_CONTENTS);
 ```
 
-The plugin lists services whose calls it can't see.
+### Which end to turn it on
+
+Turning it on at **one end** is enough for the call to appear. Both ends give the
+most detail.
+
+| Turned on at | Call shown? | Caller identified | Steps seen | Timing |
+|---|---|---|---|---|
+| Server only | Yes | Exactly | received, responded | Server processing time |
+| Caller only | Yes | Exactly | sent, response received | Round-trip time |
+| Both | Yes | Exactly | all four | Both |
+| Neither | **No** | | | |
+
+Turning it on at the **server** covers every caller of that service, including
+nodes you don't control and `ros2 service call` from a terminal.
+
+### Full data or timing only
+
+- `CONTENTS` (used above) also shows the request and response data in the details
+  panel.
+- `METADATA` shows the call and its timing without the data. Use it for large or
+  private data. In Python that's `ServiceIntrospectionState.METADATA`, in C++
+  `RCL_SERVICE_INTROSPECTION_METADATA`.
+
+Introspection adds one hidden topic per service, `<service>/_service_event`. With
+`CONTENTS`, each request and response is also copied onto that topic.
 
 ## How callers and nesting are found
 
