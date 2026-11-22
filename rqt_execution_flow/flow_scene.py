@@ -20,6 +20,9 @@ from .tracker import ACTION
 ACTION_COLOR = QColor('#2563eb')
 SERVICE_COLOR = QColor('#9333ea')
 IDLE_COLOR = QColor('#94a3b8')
+SLOW_COLOR = QColor('#dc2626')
+FOCUS_COLOR = QColor('#f59e0b')
+FADED = 0.22
 TEXT_COLOR = QColor('#0f172a')
 MUTED_TEXT = QColor('#64748b')
 
@@ -67,6 +70,8 @@ class NodeItem(QGraphicsItem):
         self.busy = False
         self.pinned = False
         self.roles = {}     # role -> count, or a short note for pseudo nodes
+        self.focused = False
+        self._press_pos = None
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable
                       | QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(3)
@@ -103,7 +108,10 @@ class NodeItem(QGraphicsItem):
             p.restore()
 
         border = TEXT_COLOR if self.isSelected() else (ACTION_COLOR if self.busy else IDLE_COLOR)
-        p.setPen(QPen(border, 2.2 if (self.busy or self.isSelected()) else 1.2))
+        width = 2.2 if (self.busy or self.isSelected()) else 1.2
+        if self.focused:
+            border, width = FOCUS_COLOR, 3.2
+        p.setPen(QPen(border, width))
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(rect, 8, 8)
 
@@ -170,6 +178,18 @@ class NodeItem(QGraphicsItem):
         self.pinned = True   # user placed it, layout leaves it alone
         super().mouseMoveEvent(event)
 
+    def mousePressEvent(self, event):
+        self._press_pos = event.scenePos()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        # a click (not a drag) focuses the view on this node
+        if self._press_pos is not None and \
+                (event.scenePos() - self._press_pos).manhattanLength() < 4 and self.scene():
+            self.scene().node_clicked(self.name)
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
+
 
 class EdgeLabel(QGraphicsItem):
 
@@ -219,6 +239,7 @@ class EdgeItem(QGraphicsPathItem):
         self.flash_color = None
         self.flash_left = 0.0
         self.pending_flash = None
+        self.slow = False
         self.phase = 0.0
         self.setZValue(1)
         self.label = EdgeLabel(self)
@@ -230,6 +251,8 @@ class EdgeItem(QGraphicsPathItem):
     def current_color(self):
         if self.flash_color is not None and self.flash_left > 0:
             return QColor(self.flash_color)
+        if self.active_count > 0 and self.slow:
+            return QColor(SLOW_COLOR)
         return QColor(self.base_color if self.active_count > 0 else IDLE_COLOR)
 
     def refresh_label(self):
@@ -413,6 +436,8 @@ class FlowScene(QGraphicsScene):
         self.isolated = set()
         self.clock = 0.0                      # animation time, advanced by tick()
         self.scheduler = PacketScheduler()    # keeps cause and effect in the animation
+        self.on_node_clicked = None           # callback(name), set by the widget
+        self.focus = None                     # node name the view is focused on
         tile = QPixmap(28, 28)
         tile.fill(QColor('#f8fafc'))
         painter = QPainter(tile)
@@ -461,6 +486,8 @@ class FlowScene(QGraphicsScene):
             self._assign_lanes()
             self.layout()
         self._placeholder.setVisible(not self.nodes)
+        if changed:
+            self._apply_focus()
         return changed
 
     def ensure_edge(self, key):
@@ -473,6 +500,7 @@ class FlowScene(QGraphicsScene):
         self._assign_lanes()
         self.layout()
         self._placeholder.setVisible(False)
+        self._apply_focus()
         return True
 
     def _add_node(self, name):
@@ -563,17 +591,43 @@ class FlowScene(QGraphicsScene):
         if ptype in FLASH:
             edge.pending_flash = (FLASH[ptype], wait + travel)
 
-    def set_activity(self, counts, busy_nodes):
+    def node_clicked(self, name):
+        if self.on_node_clicked is not None:
+            self.on_node_clicked(name)
+
+    def set_focus(self, name):
+        """Fade everything not connected to ``name``; None shows everything."""
+        self.focus = name
+        self._apply_focus()
+
+    def _apply_focus(self):
+        name = self.focus if self.focus in self.nodes else None
+        near = set()
+        for key, edge in self.edges.items():
+            touches = name is None or name in (key[2], key[3])
+            edge.setOpacity(1.0 if touches else FADED)
+            if name is not None and touches:
+                near.update((key[2], key[3]))
+        for n, node in self.nodes.items():
+            node.setOpacity(1.0 if name is None or n in near or n == name else FADED)
+            if node.focused != (n == name):
+                node.focused = n == name
+                node.update()
+
+    def set_activity(self, counts, busy_nodes, slow_keys=()):
         # The animation can run a little behind real time (see schedule.py).
         # Keep a link busy, and its server working, until its packets have landed.
         in_flight = {pk.edge.key for pk in self.packets if pk.ptype != 'feedback'}
         busy_nodes = set(busy_nodes) | {key[3] for key in in_flight}
+        slow_keys = set(slow_keys)
         for key, edge in self.edges.items():
             c = counts.get(key, 0) or (1 if key in in_flight else 0)
             if c:
                 edge.ever_active = True
-            if c != edge.active_count:
+            slow = key in slow_keys
+            if c != edge.active_count or slow != edge.slow:
                 edge.active_count = c
+                edge.slow = slow
                 edge.refresh_label()
                 edge.update()
         for name, node in self.nodes.items():

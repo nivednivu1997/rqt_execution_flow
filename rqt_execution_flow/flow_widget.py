@@ -12,15 +12,16 @@ from python_qt_binding.QtCore import Qt, QTimer
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from python_qt_binding.QtGui import QBrush, QColor, QFont
 from python_qt_binding.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
-                                         QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-                                         QLabel, QLineEdit, QMessageBox, QPushButton,
-                                         QSlider, QSplitter, QTextBrowser, QTreeWidget,
-                                         QTreeWidgetItem, QVBoxLayout, QWidget)
+                                         QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+                                         QHeaderView, QLabel, QLineEdit, QMessageBox,
+                                         QPushButton, QSlider, QSplitter, QTabWidget,
+                                         QTextBrowser, QTreeWidget, QTreeWidgetItem,
+                                         QVBoxLayout, QWidget)
 
 from .flow_scene import PACKETS, ROLE_COLORS, ROLE_LABELS, ROLE_ORDER, FlowScene, FlowView
 from .monitor import RosMonitor
 from .recorder import Player, Recording
-from .tracker import ACTION, GOAL_STATUS, UNKNOWN_NODE, Tracker
+from .tracker import ACTION, GOAL_STATUS, UNKNOWN_NODE, Tracker, UiEvent
 
 STATUS_COLORS = {
     'ACCEPTED': '#2563eb', 'EXECUTING': '#2563eb', 'CANCELING': '#ea580c',
@@ -52,6 +53,39 @@ RECORDINGS_DIR = os.path.join(
     os.environ.get('ROS_HOME') or os.path.join(os.path.expanduser('~'), '.ros'),
     'rqt_execution_flow', 'recordings')
 QUIET_GAP = 0.4     # recorded seconds of nothing happening that replay skips over
+DEFAULT_SLOW = 5.0  # seconds after which a call counts as slow
+SLOW_RED = '#dc2626'
+SHOW_MODES = [('all', 'All calls'), ('running', 'Running'), ('ok', 'Succeeded'),
+              ('canceled', 'Canceled'), ('failed', 'Failed'), ('slow', 'Slow'),
+              ('problems', 'Problems')]
+STATS_COLS = [
+    ('Action / service', ''), ('Kind', ''), ('Calls', 'Calls since start or Clear'),
+    ('Running', 'Calls running right now'), ('OK', 'Succeeded or answered'),
+    ('Canceled', ''), ('Failed', 'Aborted goals. Services have no failure state.'),
+    ('Slow', 'Finished calls that took longer than the slow limit'),
+    ('Avg', 'Average duration'), ('p95', '95% of calls were faster than this'),
+    ('Max', 'Slowest call')]
+
+
+class _SortItem(QTreeWidgetItem):
+    """Sorts by the value stored in UserRole, so numbers sort as numbers."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        a, b = self.data(col, Qt.UserRole), other.data(col, Qt.UserRole)
+        if a is not None and b is not None:
+            try:
+                return a < b
+            except TypeError:
+                pass
+        return self.text(col) < other.text(col)
+
+
+def _seconds(v):
+    if v is None:
+        return '\u2013'
+    return f'{v * 1000:.0f} ms' if v < 1.0 else f'{v:.2f} s'
 
 
 def _clock(t):
@@ -77,6 +111,10 @@ class ExecutionFlowWidget(QWidget):
         self._paused = False
         self._selected_uid = None
         self._details_dirty = False
+        self._node_filter = None     # node clicked in the flow view
+        self._slow_logged = set()    # uids already reported as slow
+        self._stats_items = {}       # name -> statistics row
+        self._last_stats = 0.0
         self._mode = 'live'          # 'live' or 'replay'
         self._recording = None       # Recording while the record button is on
         self._last_recording = None
@@ -87,6 +125,7 @@ class ExecutionFlowWidget(QWidget):
         self._last_frame = time.monotonic()
         self._last_slow = 0.0
         self._build_ui()
+        self._scene.on_node_clicked = self._on_node_clicked
 
         self._graph_timer = QTimer(self)
         self._graph_timer.timeout.connect(self._refresh_graph)
@@ -157,13 +196,36 @@ class ExecutionFlowWidget(QWidget):
         self._hide_idle.setToolTip('Hide actions and services that have not been called yet')
         self._hide_idle.toggled.connect(lambda _: self._refresh_topology())
         bar.addWidget(self._hide_idle)
-        self._hide_done = QCheckBox('Hide finished')
-        self._hide_done.toggled.connect(lambda _: self._apply_tree_filter())
-        bar.addWidget(self._hide_done)
         self._log_fb = QCheckBox('Log every feedback')
         bar.addWidget(self._log_fb)
         root.addLayout(bar)
-        root.addLayout(self._build_record_bar())
+        rec_bar = self._build_record_bar()
+        self._node_chip = QPushButton()
+        self._node_chip.setVisible(False)
+        self._node_chip.setStyleSheet(
+            'QPushButton { background: #fef3c7; border: 1px solid #f59e0b; '
+            'border-radius: 4px; padding: 2px 8px; }')
+        self._node_chip.clicked.connect(lambda: self._set_node_filter(None))
+        rec_bar.addWidget(self._node_chip)
+        rec_bar.addWidget(QLabel('Show:'))
+        self._show_box = QComboBox()
+        for key, label in SHOW_MODES:
+            self._show_box.addItem(label, key)
+        self._show_box.setToolTip('Show only some calls in the tree and timeline.\n'
+                                  'Problems = canceled, failed or slow.')
+        self._show_box.currentIndexChanged.connect(lambda _: self._apply_filters())
+        rec_bar.addWidget(self._show_box)
+        rec_bar.addWidget(QLabel('Slow after'))
+        self._slow_limit = QDoubleSpinBox()
+        self._slow_limit.setRange(0.1, 3600.0)
+        self._slow_limit.setDecimals(1)
+        self._slow_limit.setSingleStep(0.5)
+        self._slow_limit.setSuffix(' s')
+        self._slow_limit.setValue(DEFAULT_SLOW)
+        self._slow_limit.setToolTip('Calls running longer than this turn red')
+        self._slow_limit.valueChanged.connect(lambda _: self._on_slow_limit_changed())
+        rec_bar.addWidget(self._slow_limit)
+        root.addLayout(rec_bar)
         # replay controls get their own row so the window never has to grow wider
         root.addWidget(self._replay_box)
 
@@ -234,7 +296,27 @@ class ExecutionFlowWidget(QWidget):
             f'<b>Flow</b>&nbsp;&nbsp;&nbsp;<span style="color:#64748b">Node roles:</span>'
             f'&nbsp;&nbsp;{key}')
         self._right_split.addWidget(flow_box)
-        self._right_split.addWidget(self._titled('Event timeline', self._log))
+        self._stats = QTreeWidget()
+        self._stats.setRootIsDecorated(False)
+        self._stats.setUniformRowHeights(True)
+        self._stats.setColumnCount(len(STATS_COLS))
+        self._stats.setHeaderLabels([c for c, _ in STATS_COLS])
+        for col, (_, tip) in enumerate(STATS_COLS):
+            if tip:
+                self._stats.headerItem().setToolTip(col, tip)
+        self._stats.header().resizeSection(0, 230)
+        for col in range(1, len(STATS_COLS)):
+            self._stats.header().resizeSection(col, 84)
+        self._stats.setSortingEnabled(True)
+        self._stats.sortByColumn(2, Qt.DescendingOrder)
+        self._stats.setToolTip('Double-click a row to filter the call tree by that name')
+        self._stats.itemDoubleClicked.connect(
+            lambda item, _col: self._filter.setText(item.text(0)))
+        self._bottom_tabs = QTabWidget()
+        self._bottom_tabs.addTab(self._log, 'Event timeline')
+        self._bottom_tabs.addTab(self._stats, 'Statistics')
+        self._bottom_tabs.currentChanged.connect(lambda _: self._update_stats())
+        self._right_split.addWidget(self._bottom_tabs)
         self._right_split.setSizes([600, 340])
 
         self._main_split = QSplitter(Qt.Horizontal)
@@ -552,12 +634,25 @@ class ExecutionFlowWidget(QWidget):
         active = self._tracker.active
         counts = Counter(op.edge_key() for op in active)
         busy = {op.server for op in active if op.server}
-        self._scene.set_activity(counts, busy)
         now = self._now()
-        for op in active:
+        limit = self._slow_limit.value()
+        slow_keys = set()
+        for op in list(active):
+            slow = self._is_slow(op, now)
+            if slow:
+                slow_keys.add(op.edge_key())
             item = self._items.get(op.uid)
             if item is not None:
                 item.setText(COL_DUR, self._duration_text(op, now))
+                self._style_slow(item, op, now)
+            if slow and op.uid not in self._slow_logged:
+                self._slow_logged.add(op.uid)
+                self._add_log(UiEvent('log', op, text=f'Slow: running over {limit:g} s', t=now))
+                if item is not None:
+                    self._apply_tree_filter_to(item)
+        self._scene.set_activity(counts, busy, slow_keys)
+        if time.monotonic() - self._last_stats > 1.0:
+            self._update_stats()
         if self._details_dirty or (
                 self._selected_uid is not None and
                 self._tracker.by_uid.get(self._selected_uid) in active):
@@ -629,7 +724,8 @@ class ExecutionFlowWidget(QWidget):
         font.setBold(op.active)
         for col in range(5):
             item.setFont(col, font)
-        if self._hide_done.isChecked() and not op.active:
+        self._style_slow(item, op, self._now())
+        if self._filters_active(self._filters()):
             self._apply_tree_filter_to(item)
 
     @staticmethod
@@ -673,39 +769,145 @@ class ExecutionFlowWidget(QWidget):
 
     def _on_filter_changed(self, _):
         self._refresh_topology()
-        self._apply_tree_filter()
+        self._apply_filters()
 
-    def _visible(self, op, text, hide_done):
-        """An item stays visible if it, or one of its children, should be shown."""
-        own = True
-        if text:
-            own = any(text in (s or '').lower() for s in (op.name, op.client, op.server))
-        if hide_done and not op.active:
-            own = False
-        return own or any(self._visible(c, text, hide_done) for c in op.children)
+    # ---- slow calls
+    def _is_slow(self, op, now):
+        return not op.partial and op.duration(now) > self._slow_limit.value()
+
+    def _style_slow(self, item, op, now):
+        slow = self._is_slow(op, now)
+        background = QBrush(QColor('#fee2e2')) if (slow and op.active) else None
+        for col in range(5):
+            item.setData(col, Qt.BackgroundRole, background)
+        item.setData(COL_DUR, Qt.ForegroundRole, QBrush(QColor(SLOW_RED)) if slow else None)
+        item.setToolTip(COL_DUR, f'Longer than the slow limit of '
+                                 f'{self._slow_limit.value():g} s' if slow else '')
+
+    def _on_slow_limit_changed(self):
+        now = self._now()
+        for uid, item in list(self._items.items()):
+            op = self._tracker.by_uid.get(uid)
+            if op is not None:
+                self._style_slow(item, op, now)
+        self._apply_filters()
+        self._update_stats()
+
+    # ---- node focus
+    def _on_node_clicked(self, name):
+        self._set_node_filter(None if name == self._node_filter else name)
+
+    def _set_node_filter(self, name):
+        self._node_filter = name
+        self._scene.set_focus(name)
+        if name:
+            self._node_chip.setText(f'Node: {_short(name)}  \u2715')
+            self._node_chip.setToolTip(f'Showing only calls made or served by {name}.\n'
+                                       'Click here, or the node again, to show all.')
+        self._node_chip.setVisible(bool(name))
+        self._apply_filters()
+
+    # ---- filtering the tree and the timeline
+    def _filters(self):
+        return (self._filter.text().strip().lower(), self._node_filter,
+                self._show_box.currentData() or 'all', self._now())
+
+    @staticmethod
+    def _filters_active(f):
+        return bool(f[0] or f[1] or f[2] != 'all')
+
+    def _matches(self, op, f):
+        text, node, mode, now = f
+        if text and not any(text in (s or '').lower() for s in (op.name, op.client, op.server)):
+            return False
+        if node and node not in (op.client, op.server):
+            return False
+        if mode == 'all':
+            return True
+        slow = self._is_slow(op, now)
+        return {'running': op.active, 'ok': op.outcome == 'ok',
+                'canceled': op.outcome == 'canceled', 'failed': op.outcome == 'failed',
+                'slow': slow,
+                'problems': slow or op.outcome in ('canceled', 'failed')}.get(mode, True)
+
+    def _visible(self, op, f):
+        """A row stays visible if it, or one of its children, matches."""
+        return self._matches(op, f) or any(self._visible(c, f) for c in op.children)
+
+    def _apply_filters(self):
+        self._apply_tree_filter()
+        self._apply_log_filter()
 
     def _apply_tree_filter(self):
+        f = self._filters()
         for uid in list(self._items):
-            self._apply_tree_filter_to(self._items[uid])
+            self._apply_tree_filter_to(self._items[uid], f)
 
-    def _apply_tree_filter_to(self, item):
+    def _apply_tree_filter_to(self, item, f=None):
         uid = item.data(COL_CALL, Qt.UserRole)
         op = self._tracker.by_uid.get(uid)
         if op is None:
             return
-        text = self._filter.text().strip().lower()
-        hide_done = self._hide_done.isChecked()
-        if not text and not hide_done:
+        f = f or self._filters()
+        if not self._filters_active(f):
             item.setHidden(False)
             return
-        item.setHidden(not self._visible(op, text, hide_done))
+        item.setHidden(not self._visible(op, f))
         # parents must stay visible if a child became visible
         p = item.parent()
         while p is not None:
             pop = self._tracker.by_uid.get(p.data(COL_CALL, Qt.UserRole))
             if pop is not None:
-                p.setHidden(not self._visible(pop, text, hide_done))
+                p.setHidden(not self._visible(pop, f))
             p = p.parent()
+
+    def _apply_log_filter(self):
+        f = self._filters()
+        active = self._filters_active(f)
+        for i in range(self._log.topLevelItemCount()):
+            row = self._log.topLevelItem(i)
+            row.setHidden(self._log_hidden(row, f, active))
+
+    def _log_hidden(self, row, f, active):
+        if not active:
+            return False
+        op = self._tracker.by_uid.get(row.data(0, Qt.UserRole))
+        return op is None or not self._matches(op, f)
+
+    # ---- statistics
+    def _update_stats(self):
+        self._last_stats = time.monotonic()
+        if self._bottom_tabs.currentWidget() is not self._stats:
+            return
+        limit = self._slow_limit.value()
+        running = Counter(op.name for op in self._tracker.active)
+        self._stats.setSortingEnabled(False)
+        for name, st in self._tracker.stats.items():
+            item = self._stats_items.get(name)
+            if item is None:
+                item = _SortItem()
+                self._stats.addTopLevelItem(item)
+                self._stats_items[name] = item
+            tm = st.timing(limit)
+            is_action = st.kind == ACTION
+            values = [
+                (name, name), ('Action' if is_action else 'Service', st.kind),
+                (str(st.calls), st.calls), (str(running[name]), running[name]),
+                (str(st.ok), st.ok), (str(st.canceled), st.canceled),
+                (str(st.failed) if is_action else '\u2013', st.failed if is_action else -1),
+                (str(tm['slow']), tm['slow']),
+                (_seconds(tm['avg']), tm['avg'] if tm['avg'] is not None else -1.0),
+                (_seconds(tm['p95']), tm['p95'] if tm['p95'] is not None else -1.0),
+                (_seconds(tm['max']), tm['max'] if tm['max'] is not None else -1.0)]
+            for col, (text, key) in enumerate(values):
+                item.setText(col, text)
+                item.setData(col, Qt.UserRole, key)
+            item.setToolTip(0, st.type or name)
+            item.setForeground(0, QBrush(QColor('#2563eb' if is_action else '#9333ea')))
+            for col, bad, color in ((5, st.canceled, '#d97706'), (6, st.failed, SLOW_RED),
+                                    (7, tm['slow'], SLOW_RED)):
+                item.setData(col, Qt.ForegroundRole, QBrush(QColor(color)) if bad else None)
+        self._stats.setSortingEnabled(True)
 
     def _on_tree_selection(self):
         items = self._tree.selectedItems()
@@ -737,9 +939,14 @@ class ExecutionFlowWidget(QWidget):
             color = '#16a34a'
         if color:
             item.setForeground(1, QBrush(QColor(color)))
+        if color is None and ui.text.startswith('Slow'):
+            item.setForeground(1, QBrush(QColor(SLOW_RED)))
         scrollbar = self._log.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         self._log.addTopLevelItem(item)
+        f = self._filters()
+        if self._filters_active(f):
+            item.setHidden(self._log_hidden(item, f, True))
         while self._log.topLevelItemCount() > MAX_LOG_ROWS:
             self._log.takeTopLevelItem(0)
         if at_bottom:
@@ -827,6 +1034,9 @@ class ExecutionFlowWidget(QWidget):
 
     def _reset_display(self):
         self._tracker.clear()
+        self._slow_logged.clear()
+        self._stats.clear()
+        self._stats_items.clear()
         self._tree.clear()
         self._log.clear()
         self._items.clear()
@@ -848,7 +1058,8 @@ class ExecutionFlowWidget(QWidget):
 
     def save_settings(self, settings):
         settings.set_value('hide_idle', self._hide_idle.isChecked())
-        settings.set_value('hide_done', self._hide_done.isChecked())
+        settings.set_value('show', self._show_box.currentData())
+        settings.set_value('slow_limit', self._slow_limit.value())
         settings.set_value('log_feedback', self._log_fb.isChecked())
         settings.set_value('replay_speed', self._speed)
         settings.set_value('filter', self._filter.text())
@@ -861,7 +1072,14 @@ class ExecutionFlowWidget(QWidget):
             v = settings.value(name, False)
             return v in (True, 'true', 'True', 1, '1')
         self._hide_idle.setChecked(flag('hide_idle'))
-        self._hide_done.setChecked(flag('hide_done'))
+        mode = settings.value('show', None) or ('running' if flag('hide_done') else 'all')
+        idx = self._show_box.findData(mode)
+        if idx >= 0:
+            self._show_box.setCurrentIndex(idx)
+        try:
+            self._slow_limit.setValue(float(settings.value('slow_limit', DEFAULT_SLOW)))
+        except (TypeError, ValueError):
+            pass
         self._log_fb.setChecked(flag('log_feedback'))
         self._filter.setText(settings.value('filter', '') or '')
         try:

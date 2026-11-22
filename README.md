@@ -53,6 +53,12 @@ It is **read-only**. It never sends goals, cancels goals or calls services.
 - **Record and replay.** Record a run, then replay it at 0.1× to 2× speed, step
   through it one event at a time, or jump anywhere with a slider. Recordings are
   saved as files you can share.
+- **Slow and stuck calls.** Calls running longer than a limit you set turn red in the
+  tree and the flow view.
+- **Statistics.** For every action and service: calls, running, succeeded, canceled,
+  failed, slow, and average, 95th-percentile and slowest time.
+- **Focus and filters.** Click a node to see only its calls. Show only running,
+  succeeded, canceled, failed or slow calls.
 - **Problem warnings.** Flags node names used by more than one node, which makes
   goals and replies go to the wrong copy, and services whose calls can't be seen.
 
@@ -136,8 +142,62 @@ When the tags don't fit, they switch to short forms such as `A-srv` and `S-cli`.
 | Purple | Service server |
 | Rose | Service client |
 
-Toolbar options: **Filter** by name, **Only links with traffic**, **Hide finished**,
-**Log every feedback**, **Fit view**, **Re-layout**, **Pause** and **Clear**.
+Toolbar options: **Filter** by name, **Only links with traffic**, **Log every
+feedback**, **Fit view**, **Re-layout**, **Pause** and **Clear**.
+
+### Finding slow or stuck calls
+
+Set **Slow after** (default 5 s). When a call runs longer than that:
+
+- its row in the call tree turns red while it runs
+- its link in the flow view turns red
+- the timeline adds a `Slow: running over N s` line, once per call
+
+Finished calls that took longer keep a red duration. Changing the limit updates
+everything straight away.
+
+### Filtering by result
+
+The **Show** list limits the call tree and the timeline to some calls:
+
+| Choice | Shows |
+|---|---|
+| All calls | Everything |
+| Running | Calls still in progress |
+| Succeeded | Goals that succeeded and services that answered |
+| Canceled | Canceled goals |
+| Failed | Aborted goals |
+| Slow | Calls longer than the slow limit |
+| Problems | Canceled, failed or slow |
+
+Parent calls stay visible, so you can still see what triggered a matching call.
+
+### Focusing on one node
+
+**Click a node** in the flow view. The call tree and the timeline then show only
+calls that node made or served. The node gets an amber border, and unrelated nodes
+and links fade. Click the node again, or the `Node: … ✕` chip, to show everything.
+Dragging a node moves it without focusing.
+
+### Statistics
+
+The **Statistics** tab, next to the event timeline, has one row per action and
+service:
+
+| Column | Meaning |
+|---|---|
+| Calls | Calls since the plugin started or since **Clear** |
+| Running | Calls in progress right now |
+| OK, Canceled, Failed | How the calls ended. Services have no failure state. |
+| Slow | Finished calls longer than the slow limit |
+| Avg, p95, Max | Average, 95th-percentile and slowest duration |
+
+Click a column header to sort, for example by **Max** to find the slowest service.
+Double-click a row to filter the call tree by that name. Calls that started before
+the plugin was watching are counted, but not timed. Statistics aren't affected by
+the filters.
+
+![Slow limit at 2 s: slow calls in red in the tree and the flow view, and the Statistics tab](docs/statistics.png)
 
 ## Record and replay
 
@@ -295,17 +355,19 @@ Turn on service introspection in that service's server or callers. See
 ```
 rqt_execution_flow/
 ├── monitor.py        # ROS side: discovers actions and services, subscribes to hidden topics
-├── tracker.py        # turns raw events into calls and works out who called whom
+├── tracker.py        # turns raw events into calls, works out who called whom, statistics
+├── schedule.py       # orders animated packets so causes always come before effects
 ├── recorder.py       # recording, playback and file format
-├── flow_widget.py    # main window: call tree, timeline, details, record/replay controls
-├── flow_scene.py     # animated flow view
+├── flow_widget.py    # main window: call tree, timeline, statistics, filters, record/replay
+├── flow_scene.py     # animated flow view, node roles and focus
 ├── introspection.py  # helper to enable service introspection in your nodes
 ├── plugin.py         # rqt plugin entry point
 ├── main.py           # standalone entry point
 └── demo.py           # demo system
 ```
 
-`tracker.py` and `recorder.py` have no ROS or Qt imports and are unit tested.
+`tracker.py`, `schedule.py` and `recorder.py` have no ROS or Qt imports and are unit
+tested.
 
 ## Running the tests
 
