@@ -183,3 +183,38 @@ def test_missing_type_is_filled_in_later():
     t.set_graph(GraphSnapshot(service_servers={'/sensor': {'/s'}},
                               service_types={'/sensor': 'pkg/srv/Thing'}))
     assert op.type == 'pkg/srv/Thing'
+
+
+def test_statistics_count_outcomes_and_timings():
+    t = make_tracker()
+    t.handle(('goal_status', 0.0, '/main_task', 'a', 2))
+    t.handle(('goal_status', 2.0, '/main_task', 'a', 4))       # ok, 2 s
+    t.handle(('goal_status', 3.0, '/main_task', 'b', 2))
+    t.handle(('goal_status', 3.5, '/main_task', 'b', 5))       # canceled, 0.5 s
+    t.handle(('goal_status', 4.0, '/main_task', 'c', 2))
+    t.handle(('goal_status', 10.0, '/main_task', 'c', 6))      # failed, 6 s
+    t.handle(('goal_status', 11.0, '/main_task', 'd', 2))      # still running
+    st = t.stats['/main_task']
+    assert (st.calls, st.ok, st.canceled, st.failed) == (4, 1, 1, 1)
+    timing = st.timing(slow_limit=5.0)
+    assert abs(timing['avg'] - 8.5 / 3) < 1e-9
+    assert timing['max'] == 6.0 and timing['slow'] == 1
+    assert timing['p95'] == 6.0          # 3 samples: the 95th percentile is the top one
+
+
+def test_statistics_survive_pruning_and_reset_on_clear():
+    t = Tracker(max_roots=2)
+    for i in range(5):
+        t.handle(('service_event', float(i), '/s', 0, '/c', '/c', i, None, 0.0))
+        t.handle(('service_event', i + 0.2, '/s', 3, '/c', '/c', i, None, 0.0))
+    assert len(t.roots) == 2
+    assert t.stats['/s'].calls == 5 and len(t.stats['/s'].durations) == 5
+    t.clear()
+    assert t.stats == {}
+
+
+def test_partial_calls_are_counted_but_not_timed():
+    t = make_tracker()
+    t.handle(('service_event', 1.0, '/get_data', 3, '/c', '/c', 1, None, 0.0))
+    st = t.stats['/get_data']
+    assert st.calls == 1 and st.ok == 1 and st.timing(5.0)['avg'] is None

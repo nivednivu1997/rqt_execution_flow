@@ -19,6 +19,8 @@ server of an operation that is running right now, the running one is the parent.
 """
 
 import itertools
+import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -113,6 +115,41 @@ class Operation:
 
 
 @dataclass
+class CallStats:
+    """Counts and timings for one action or service name, since the last clear."""
+
+    name: str
+    kind: str
+    type: str = ''
+    calls: int = 0
+    ok: int = 0
+    canceled: int = 0
+    failed: int = 0
+    durations: 'OrderedDict[int, float]' = field(default_factory=OrderedDict)
+
+    MAX_SAMPLES = 5000
+
+    def record(self, uid: int, seconds: float):
+        self.durations[uid] = seconds
+        self.durations.move_to_end(uid)
+        while len(self.durations) > self.MAX_SAMPLES:
+            self.durations.popitem(last=False)
+
+    def timing(self, slow_limit: float) -> dict:
+        """avg, p95 and max in seconds (None without samples), and how many were slow."""
+        values = sorted(self.durations.values())
+        if not values:
+            return {'avg': None, 'p95': None, 'max': None, 'slow': 0}
+        return {
+            'avg': sum(values) / len(values),
+            # nearest-rank percentile: never below the average with few samples
+            'p95': values[max(0, math.ceil(0.95 * len(values)) - 1)],
+            'max': values[-1],
+            'slow': sum(1 for v in values if v > slow_limit),
+        }
+
+
+@dataclass
 class UiEvent:
     kind: str                      # 'new', 'update', 'packet', 'log', 'removed'
     op: Operation
@@ -137,6 +174,7 @@ class Tracker:
         self.roots: List[Operation] = []
         self.active: List[Operation] = []
         self._unresolved: Dict[int, int] = {}   # op uid -> graph updates tried
+        self.stats: Dict[str, CallStats] = {}   # action / service name -> stats
         self._uid = itertools.count(1)
 
     def set_graph(self, graph: GraphSnapshot) -> List[Operation]:
@@ -158,6 +196,8 @@ class Tracker:
             if not op.type:
                 types = graph.action_types if is_action else graph.service_types
                 op.type = types.get(op.name, '')
+                if op.type and op.name in self.stats:
+                    self.stats[op.name].type = op.type
             if op.server is None:
                 servers = graph.action_servers if is_action else graph.service_servers
                 server, _ = self._pick(servers.get(op.name), 'server')
@@ -294,6 +334,9 @@ class Tracker:
             op.start = t
         if code in (REQUEST_SENT, REQUEST_RECEIVED):
             op.partial = False
+        if op.end is not None and not op.partial:
+            # a late request event changed the start of a finished call
+            self.stats[op.name].record(op.uid, op.end - op.start)
         op.history.append((t, label))
         op.history.sort(key=lambda h: h[0])
         if stamp:
@@ -318,6 +361,10 @@ class Tracker:
 
     # -------------------------------------------------------------- helpers
     def _new_op(self, kind, name, key, t, out, **fields) -> Operation:
+        st = self.stats.setdefault(name, CallStats(name, kind))
+        st.calls += 1
+        if fields.get('type'):
+            st.type = fields['type']
         op = Operation(uid=next(self._uid), kind=kind, name=name, key=key, start=t,
                        next_packet_time=t, **fields)
         self._infer_parent(op)
@@ -422,6 +469,15 @@ class Tracker:
         op.outcome = outcome
         if op in self.active:
             self.active.remove(op)
+        st = self.stats[op.name]
+        if outcome == 'ok':
+            st.ok += 1
+        elif outcome == 'canceled':
+            st.canceled += 1
+        elif outcome == 'failed':
+            st.failed += 1
+        if not op.partial:
+            st.record(op.uid, op.end - op.start)
 
     def _subtree_active(self, op) -> bool:
         return op.active or any(self._subtree_active(c) for c in op.children)
