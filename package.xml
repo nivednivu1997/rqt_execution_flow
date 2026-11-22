@@ -2,13 +2,14 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>rqt_execution_flow</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>
-    rqt plugin that visualizes ROS 2 action goals and service calls live:
-    nested call tree, animated goal/feedback/cancel/result flow, and an event timeline.
-    It only watches; it never sends goals, cancels or service requests.
+    rqt plugin that shows ROS 2 action goals and service calls live: a nested call
+    tree, an animated flow of goals, feedback, cancels, results, requests and
+    responses, an event timeline, per-call statistics, slow-call flags, and record
+    and slow-motion replay. Read-only: it never sends goals, cancels or service calls.
   </description>
-  <maintainer email="85388186+nivednivu1997@users.noreply.github.com">Nived Krishnan</maintainer>
+  <maintainer email="nivednivu1997@gmail.com">Nived Krishnan</maintainer>
   <license>Apache-2.0</license>
 
   <url type="website">https://github.com/nivednivu1997/rqt_execution_flow</url>
