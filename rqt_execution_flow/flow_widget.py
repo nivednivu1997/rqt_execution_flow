@@ -164,6 +164,8 @@ class ExecutionFlowWidget(QWidget):
         bar.addWidget(self._log_fb)
         root.addLayout(bar)
         root.addLayout(self._build_record_bar())
+        # replay controls get their own row so the window never has to grow wider
+        root.addWidget(self._replay_box)
 
         legend = '  '.join(
             f'<span style="color:{c}; font-size:14px;">'
@@ -313,9 +315,7 @@ class ExecutionFlowWidget(QWidget):
         back.clicked.connect(self._exit_replay)
         rb.addWidget(back)
         self._replay_box.setVisible(False)
-        bar.addWidget(self._replay_box, 1)
-        self._record_spacer = QWidget()
-        bar.addWidget(self._record_spacer, 1)
+        bar.addStretch(1)
         return bar
 
     @staticmethod
@@ -356,6 +356,7 @@ class ExecutionFlowWidget(QWidget):
         self._status.setText(
             f'Watching {n_act} action(s) and {len(graph.introspected)} of {n_srv} service(s). '
             f'Read-only: this tool never calls, sends goals or cancels.')
+        problems = self._monitor.problems
         if dupes:
             self._warning.setText(
                 f'<b style="color:#dc2626">&#9888; {len(dupes)} node name(s) are used by more '
@@ -364,6 +365,16 @@ class ExecutionFlowWidget(QWidget):
                 'Two nodes with the same name usually means a program was started twice.\n'
                 'Goals and replies then go to the wrong copy, and calls can hang.\n'
                 'Stop the extra copy.\n\n' + '\n'.join(dupes))
+            self._warning.setVisible(True)
+        elif problems:
+            self._warning.setText(
+                f'<b style="color:#dc2626">&#9888; Can\'t load {len(problems)} message type(s). '
+                f'Source the workspace that defines them, then restart.</b>')
+            self._warning.setToolTip(
+                'The plugin needs your interface packages to show feedback and service calls.\n'
+                'Run  source <your_ws>/install/setup.bash  before starting rqt.\n\n'
+                + '\n'.join(f'{name}: {text.split(";")[0]}'
+                             for name, text in sorted(problems.items())))
             self._warning.setVisible(True)
         elif hidden:
             self._warning.setText(
@@ -379,10 +390,6 @@ class ExecutionFlowWidget(QWidget):
             self._warning.setVisible(True)
         else:
             self._warning.setVisible(False)
-        if self._monitor.problems:
-            self._status.setText(self._status.text() + '   Problems: ' +
-                                 '; '.join(f'{k}: {v}' for k, v in
-                                           list(self._monitor.problems.items())[:2]))
 
     def _refresh_topology(self):
         g = self._tracker.graph
@@ -934,11 +941,6 @@ class ExecutionFlowWidget(QWidget):
                                                    f'{path}\n\n{e}\n\nUse Save\u2026 to pick '
                                                    f'another place.')
 
-    @staticmethod
-    def _pretty_path(path):
-        home = os.path.expanduser('~')
-        return '~' + path[len(home):] if path and path.startswith(home) else path
-
     def _update_record_buttons(self):
         has = self._last_recording is not None
         replaying = self._mode == 'replay'
@@ -961,7 +963,8 @@ class ExecutionFlowWidget(QWidget):
         except OSError as e:
             QMessageBox.warning(self, 'Save recording', f'Could not save:\n{e}')
             return
-        self._rec_label.setText(f'Saved {path}')
+        self._rec_label.setText(f'Saved a copy as {os.path.basename(path)}')
+        self._rec_label.setToolTip(path)
 
     def _open_recording(self):
         start_dir = RECORDINGS_DIR if os.path.isdir(RECORDINGS_DIR) else ''
@@ -988,11 +991,11 @@ class ExecutionFlowWidget(QWidget):
         self._feed(self._player.advance_to(rec.start), animate=False)
         self._refresh_topology()
         self._replay_box.setVisible(True)
-        self._record_spacer.setVisible(False)
         self._tree_box.title_label.setText('<b style="color:#4338ca">Call tree (replay)</b>')
         self._pause_btn.setEnabled(False)
         path = getattr(rec, 'path', None)
-        where = f'  \u2022  file: {self._pretty_path(path)}' if path else '  \u2022  not saved'
+        # only the file name: a long path would force the window wider
+        where = f'  \u2022  saved as {os.path.basename(path)}' if path else '  \u2022  not saved'
         self._rec_label.setText(f'Recording: {rec.duration:.1f} s, {len(rec.events)} events'
                                 f'{where}')
         self._rec_label.setToolTip(path or 'Use Save\u2026 to keep this recording')
@@ -1011,7 +1014,6 @@ class ExecutionFlowWidget(QWidget):
         self._monitor.rebaseline()   # running goals reappear, old results don't
         self._set_graph(self._monitor.graph)
         self._replay_box.setVisible(False)
-        self._record_spacer.setVisible(True)
         self._tree_box.title_label.setText('<b>Call tree (live)</b>')
         self._pause_btn.setEnabled(True)
         self._update_record_buttons()
