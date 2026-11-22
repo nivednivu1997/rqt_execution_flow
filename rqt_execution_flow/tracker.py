@@ -150,11 +150,14 @@ class Tracker:
         for uid in list(self._unresolved):
             op = self.by_uid.get(uid)
             tries = self._unresolved[uid] + 1
-            if op is None or (op.client and op.server) or tries > 5:
+            if op is None or (op.client and op.server and op.type) or tries > 5:
                 del self._unresolved[uid]
                 continue
             self._unresolved[uid] = tries
             is_action = op.kind == ACTION
+            if not op.type:
+                types = graph.action_types if is_action else graph.service_types
+                op.type = types.get(op.name, '')
             if op.server is None:
                 servers = graph.action_servers if is_action else graph.service_servers
                 server, _ = self._pick(servers.get(op.name), 'server')
@@ -169,7 +172,7 @@ class Tracker:
                 changed.append(op)
                 self._attach_late(op)
                 changed.extend(self._adopt_orphans(op))
-            if op.client and op.server:
+            if op.client and op.server and op.type:
                 del self._unresolved[uid]
         return changed
 
@@ -321,7 +324,7 @@ class Tracker:
         self.by_key[key] = op
         self.by_uid[op.uid] = op
         self.active.append(op)
-        if not (op.client and op.server):
+        if not (op.client and op.server and op.type):
             # discovery may not be finished yet: retry on the next few graph updates
             self._unresolved[op.uid] = 0
         if op.parent is not None:

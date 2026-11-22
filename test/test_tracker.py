@@ -173,3 +173,13 @@ def test_late_parent_adopts_children_already_shown_as_roots():
     sub = t.by_key[('action', '/sub_task', 'bb')]
     assert t.roots == [main]
     assert [c.label for c in main.children] == ['/get_data #seq 1', sub.label]
+
+
+def test_missing_type_is_filled_in_later():
+    t = Tracker()
+    t.handle(('service_event', 1.0, '/sensor', 0, '/c', '/c', 1, None, 0.0))
+    op = next(iter(t.by_uid.values()))
+    assert op.type == ''
+    t.set_graph(GraphSnapshot(service_servers={'/sensor': {'/s'}},
+                              service_types={'/sensor': 'pkg/srv/Thing'}))
+    assert op.type == 'pkg/srv/Thing'
